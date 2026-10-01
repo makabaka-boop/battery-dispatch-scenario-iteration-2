@@ -65,6 +65,7 @@
               <label>初始电量<input v-model.number="editing.initial_soc" type="number" min="0" /></label>
               <label>终点最低电量<input v-model.number="editing.terminal_min_soc" type="number" min="0" /></label>
               <label>每段最大充/放<input v-model.number="editing.max_charge" type="number" min="1" /></label>
+              <label>总购电额度（可空＝不限）<input v-model.number="editing.purchase_budget" type="number" min="0" placeholder="不限" /></label>
             </div>
 
             <div class="period-head">
@@ -101,7 +102,9 @@
             </div>
             <p class="hint">
               保存必须携带所基于的修订号；服务端修订号已前进时返回 <code>409</code>，拒绝覆盖。
-              每次编辑或另存为新修订后，旧求解结果立即标记为失效历史，不会被当作新情景的计划。
+              每次编辑（含修改总购电额度）或另存为新修订后，旧求解结果立即标记为失效历史，不会被当作新情景的计划。
+              填写总购电额度后，约束作用于<strong>所有时段购电量之和</strong>并在求解中生效（非事后筛选）；
+              若仅因额度不足无解，会给出满足物理条件所需的最小总购电量。
             </p>
           </section>
 
@@ -124,12 +127,19 @@
 
   <template id="tpl-solution">
     <div v-if="!sol.feasible" class="banner conflict">
-      无可行解：{{ sol.reason }}
+      <div>无可行解：{{ sol.reason }}</div>
+      <div v-if="sol.required_min_purchase !== null && sol.required_min_purchase !== undefined" class="hint">
+        原物理条件本身可行，满足它们所需的<strong>最小总购电量</strong>为
+        {{ sol.required_min_purchase }}（当前额度 {{ sol.purchase_budget }} 不足）；
+        调大额度后重新求解，不会生成局部“当前计划”。
+      </div>
     </div>
     <template v-else>
       <div class="summary">
         <div><span class="num">{{ sol.total_cost }}</span><label>总购电费用</label></div>
         <div><span class="num">{{ sol.total_purchase }}</span><label>总购电量</label></div>
+        <div v-if="sol.purchase_budget !== null && sol.purchase_budget !== undefined">
+          <span class="num">{{ sol.purchase_budget - sol.total_purchase }}</span><label>剩余总额度</label></div>
         <div><span class="num">{{ sol.final_soc }}</span><label>终点电量</label></div>
       </div>
       <div class="table-wrap">
@@ -138,7 +148,7 @@
             <tr>
               <th>t</th><th>用电</th><th>光伏</th><th>单价</th>
               <th>期初电量</th><th>充电</th><th>放电</th><th>期末电量</th>
-              <th>购电量</th><th>弃光</th><th>费用</th>
+              <th>购电量</th><th>累计购电</th><th>剩余额度</th><th>弃光</th><th>费用</th>
             </tr>
           </thead>
           <tbody>
@@ -152,6 +162,8 @@
               <td :class="{ act: r.discharge > 0 }">{{ r.discharge }}</td>
               <td>{{ r.soc_end }}</td>
               <td :class="{ buy: r.purchase > 0 }">{{ r.purchase }}</td>
+              <td>{{ cumulative(r.period) }}</td>
+              <td :class="{ buy: r.remaining_budget === 0 }">{{ r.remaining_budget === null || r.remaining_budget === undefined ? '—' : r.remaining_budget }}</td>
               <td :class="{ cur: r.curtail > 0 }">{{ r.curtail }}</td>
               <td>{{ r.cost }}</td>
             </tr>
@@ -159,7 +171,8 @@
         </table>
       </div>
       <p class="hint" v-if="!checks.length">✅ 证据核验通过：逐段电量守恒；无同段又充又放；放电不超过净负载；
-        购电量 = max(0, 净负载 − 放电 + 充电)；弃光 = max(0, −(净负载 − 放电 + 充电))；购电与弃光不并存（不售电）。</p>
+        购电量 = max(0, 净负载 − 放电 + 充电)；弃光 = max(0, −(净负载 − 放电 + 充电))；购电与弃光不并存（不售电）；
+        剩余额度 = 总额度 − 累计购电（可互相复算）；总购电量不超过额度。</p>
       <ul v-else class="banner conflict"><li v-for="c in checks" :key="c">{{ c }}</li></ul>
     </template>
   </template>
@@ -172,6 +185,7 @@
       checks() {
         const ps = this.sol.periods;
         const bad = [];
+        let cum = 0;
         ps.forEach(r => {
           if (r.soc_end !== r.soc_start + r.charge - r.discharge) bad.push(`t${r.period} 电量不守恒`);
           if (r.charge > 0 && r.discharge > 0) bad.push(`t${r.period} 同段又充又放`);
@@ -180,8 +194,24 @@
           if (r.curtail !== Math.max(0, -(r.net_load - r.discharge + r.charge))) bad.push(`t${r.period} 弃光量不符`);
           if (r.purchase > 0 && r.curtail > 0) bad.push(`t${r.period} 同时购电与售电嫌疑`);
           if (r.cost !== r.purchase * r.price) bad.push(`t${r.period} 费用不符`);
+          cum += r.purchase;
+          if (this.sol.purchase_budget !== null && this.sol.purchase_budget !== undefined) {
+            if (r.remaining_budget !== this.sol.purchase_budget - cum)
+              bad.push(`t${r.period} 剩余额度与累计购电对不上`);
+            if (r.remaining_budget < 0) bad.push(`t${r.period} 超出购电额度`);
+          }
         });
+        if (this.sol.purchase_budget !== null && this.sol.purchase_budget !== undefined &&
+            this.sol.total_purchase > this.sol.purchase_budget)
+          bad.push('总购电量超过总额度');
         return bad;
+      }
+    },
+    methods: {
+      cumulative(idx) {
+        let q = 0;
+        for (let i = 0; i <= idx; i++) q += this.sol.periods[i].purchase;
+        return q;
       }
     },
     template: document.getElementById('tpl-solution').innerHTML
@@ -201,6 +231,7 @@
         name: s.name, load: s.load, pv: s.pv, price: s.price,
         capacity: s.capacity, initial_soc: s.initial_soc,
         terminal_min_soc: s.terminal_min_soc, max_charge: s.max_charge,
+        purchase_budget: s.purchase_budget,
       });
 
       const n = computed(() => st.editing ? st.editing.load.length : 0);
@@ -230,6 +261,9 @@
         st.savedRevision = entry.revision;
         st.savedSnapshot = { ...entry };
         st.editing = JSON.parse(JSON.stringify(entry));
+        // Old archives predate the field: missing => null (no cap).
+        if (st.editing.purchase_budget === undefined) st.editing.purchase_budget = null;
+        if (st.savedSnapshot.purchase_budget === undefined) st.savedSnapshot.purchase_budget = null;
         st.conflict = null;
         // 加载新情景：清掉一切旧求解响应。
         st.plan = null;
@@ -248,6 +282,7 @@
           pv: [0, 0, 1, 4, 6, 3, 1, 0],
           price: [3, 2, 2, 4, 5, 6, 4, 3],
           capacity: 20, initial_soc: 5, terminal_min_soc: 5, max_charge: 5,
+          purchase_budget: null,
         };
       }
 
@@ -287,7 +322,18 @@
         if (s.initial_soc < 0 || s.initial_soc > s.capacity) errs.push('初始电量越界');
         if (s.terminal_min_soc < 0 || s.terminal_min_soc > s.capacity) errs.push('终点最低电量越界');
         if (s.max_charge < 1 || s.max_charge > s.capacity) errs.push('每段最大充放电越界');
+        const b = s.purchase_budget;
+        if (b !== null && b !== undefined && b !== '' &&
+            (!Number.isInteger(b) || b < 0)) errs.push('总购电额度需为非负整数或留空');
         return errs;
+      }
+
+      // Empty number inputs arrive as '' -> send null (= no cap).
+      function toPayload(src) {
+        const { id, revision, created_at, updated_at, ...rest } = src;
+        if (rest.purchase_budget === '' || rest.purchase_budget === undefined)
+          rest.purchase_budget = null;
+        return rest;
       }
 
       async function saveScenario() {
@@ -300,7 +346,7 @@
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               expected_revision: st.savedRevision,
-              scenario: (({ id, revision, created_at, updated_at, ...rest }) => rest)(st.editing),
+              scenario: toPayload(st.editing),
             }),
           });
           if (r.status === 409) {
@@ -321,7 +367,7 @@
         if (errs.length) { st.error = errs.join('；'); return; }
         st.solving = true;
         try {
-          const payload = (({ id, revision, created_at, updated_at, ...rest }) => rest)(st.editing);
+          const payload = toPayload(st.editing);
           let r, body;
           if (!dirty.value) {
             r = await fetch(`/api/scenarios/${st.sid}/solve`, { method: 'POST' });

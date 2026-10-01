@@ -44,6 +44,8 @@ def _solution_out(sol: Solution, entry: Optional[dict] = None) -> SolutionOut:
         total_purchase=sol.total_purchase,
         final_soc=sol.final_soc,
         reason=sol.reason,
+        purchase_budget=sol.purchase_budget,
+        required_min_purchase=sol.required_min_purchase,
         periods=[
             {
                 "period": r.period,
@@ -58,6 +60,7 @@ def _solution_out(sol: Solution, entry: Optional[dict] = None) -> SolutionOut:
                 "purchase": r.purchase,
                 "curtail": r.curtail,
                 "cost": r.cost,
+                "remaining_budget": r.remaining_budget,
             }
             for r in sol.periods
         ],
@@ -74,6 +77,8 @@ def _solve_entry(entry: dict) -> Solution:
         initial_soc=entry["initial_soc"],
         terminal_min_soc=entry["terminal_min_soc"],
         max_charge=entry["max_charge"],
+        # Older stored revisions predate the field: missing key => uncapped.
+        purchase_budget=entry.get("purchase_budget"),
     )
     return solve(p)
 

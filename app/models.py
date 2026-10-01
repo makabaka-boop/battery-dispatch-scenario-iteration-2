@@ -21,6 +21,10 @@ class ScenarioInput(BaseModel):
     initial_soc: int = Field(ge=0)
     terminal_min_soc: int = Field(ge=0)
     max_charge: int = Field(ge=1)
+    # Optional hard cap on the sum of purchase over all periods.  Old stored
+    # revisions simply lack the key; it then reads back as None and solving
+    # follows the unconstrained optimum.
+    purchase_budget: Optional[int] = Field(default=None, ge=0)
 
     @field_validator("name")
     @classmethod
@@ -75,6 +79,10 @@ class PeriodOut(BaseModel):
     purchase: int
     curtail: int
     cost: int
+    # Purchase budget still unspent after this period (None when the scenario
+    # has no budget): remaining[t] == budget - sum(purchase[0..t]), so it
+    # cross-checks against cumulative purchase.
+    remaining_budget: Optional[int] = None
 
 
 class SolutionOut(BaseModel):
@@ -84,6 +92,11 @@ class SolutionOut(BaseModel):
     final_soc: Optional[int] = None
     reason: Optional[str] = None
     periods: List[PeriodOut]
+    # Echoed scenario cap (None when uncapped) and, when the physical problem
+    # is feasible but the cap is too small, the minimum total purchase that
+    # satisfying the physical constraints would require.
+    purchase_budget: Optional[int] = None
+    required_min_purchase: Optional[int] = None
 
 
 class SolveResponse(BaseModel):

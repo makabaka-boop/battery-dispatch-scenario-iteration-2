@@ -285,3 +285,153 @@ def test_index_served(client):
     assert "虚拟电池" in r.text
     assert c.get("/static/style.css").status_code == 200
     assert c.get("/static/vendor/vue.global.prod.js").status_code == 200
+
+
+# --------------------------------------------------------------------------
+# purchase budget
+# --------------------------------------------------------------------------
+
+def test_budget_validation(client):
+    c, _ = client
+    assert c.post("/api/scenarios", json=body_factory(purchase_budget=-1)).status_code == 422
+    assert c.post("/api/scenarios", json=body_factory(purchase_budget=1.5)).status_code == 422
+    assert c.post("/api/scenarios", json=body_factory(purchase_budget="x")).status_code == 422
+    # zero is a legal (very tight) cap
+    assert c.post("/api/scenarios", json=body_factory(purchase_budget=0)).status_code == 201
+
+
+def test_budget_omitted_means_uncapped(client):
+    c, _ = client
+    e = create(client)
+    assert "purchase_budget" not in e or e["purchase_budget"] is None
+    r = c.post(f"/api/scenarios/{e['id']}/solve").json()
+    sol = r["solution"]
+    assert sol["purchase_budget"] is None
+    assert sol["required_min_purchase"] is None
+    assert all(pr["remaining_budget"] is None for pr in sol["periods"])
+
+
+def test_budget_solve_boundary_and_evidence(client):
+    c, _ = client
+    e = create(client)
+    uncap = c.post(f"/api/scenarios/{e['id']}/solve").json()["solution"]
+    qstar = uncap["total_purchase"]
+    assert uncap["feasible"]
+
+    # exactly enough: feasible, remaining budget cross-checks with cumulative
+    # budget lives on the revision: save a capped revision first
+    up = c.put(f"/api/scenarios/{e['id']}",
+               json={"expected_revision": 1,
+                     "scenario": body_factory(purchase_budget=qstar)})
+    assert up.status_code == 200
+    sol = c.post(f"/api/scenarios/{e['id']}/solve").json()["solution"]
+    assert sol["feasible"]
+    assert sol["purchase_budget"] == qstar
+    assert sol["total_purchase"] == qstar
+    cum = 0
+    for pr in sol["periods"]:
+        cum += pr["purchase"]
+        assert pr["remaining_budget"] == qstar - cum
+    assert sol["periods"][-1]["remaining_budget"] == 0
+
+    # one unit short: infeasible only due to budget; minimum is reported
+    c.put(f"/api/scenarios/{e['id']}",
+          json={"expected_revision": 2,
+                "scenario": body_factory(purchase_budget=qstar - 1)})
+    bad = c.post(f"/api/scenarios/{e['id']}/solve").json()["solution"]
+    assert bad["feasible"] is False
+    assert bad["periods"] == []
+    assert bad["required_min_purchase"] == qstar
+    assert bad["purchase_budget"] == qstar - 1
+    assert "budget" in bad["reason"]
+
+
+def test_budget_physical_infeasible_has_no_required_minimum(client):
+    c, _ = client
+    e = create(client, capacity=10, max_charge=1, initial_soc=0,
+               terminal_min_soc=9, load=[3] * 8, pv=[0] * 8,
+               purchase_budget=0)
+    sol = c.post(f"/api/scenarios/{e['id']}/solve").json()["solution"]
+    assert sol["feasible"] is False
+    assert sol["required_min_purchase"] is None
+    assert "terminal" in sol["reason"]
+
+
+def test_budget_change_creates_revision_and_invalidates(client):
+    """Editing only the budget advances the revision; the r1 solve can never
+    masquerade as the r2 plan (echoed revision + frontend signature)."""
+    c, _ = client
+    e = create(client)
+    sid = e["id"]
+    r1 = c.post(f"/api/scenarios/{sid}/solve").json()
+    assert r1["revision"] == 1
+    assert r1["solution"]["purchase_budget"] is None
+
+    up = c.put(f"/api/scenarios/{sid}",
+               json={"expected_revision": 1,
+                     "scenario": body_factory(purchase_budget=3)})
+    assert up.status_code == 200 and up.json()["revision"] == 2
+    # solve r1 explicitly still echoes r1 (no cap); latest solve is capped
+    old = c.post(f"/api/scenarios/{sid}/solve", params={"revision": 1}).json()
+    new = c.post(f"/api/scenarios/{sid}/solve").json()
+    assert old["revision"] == 1 and old["solution"]["purchase_budget"] is None
+    assert new["revision"] == 2 and new["solution"]["purchase_budget"] == 3
+
+    # the input signature that the frontend compares must change with budget
+    import json
+    sig_keys = {"name", "load", "pv", "price", "capacity", "initial_soc",
+                "terminal_min_soc", "max_charge", "purchase_budget"}
+    rev1 = c.get(f"/api/scenarios/{sid}", params={"revision": 1}).json()
+    rev2 = c.get(f"/api/scenarios/{sid}").json()
+    s1 = json.dumps({k: rev1.get(k) for k in sig_keys}, sort_keys=True)
+    s2 = json.dumps({k: rev2.get(k) for k in sig_keys}, sort_keys=True)
+    assert s1 != s2
+
+
+def test_budget_adhoc_draft(client):
+    c, store = client
+    uncap = c.post("/api/solve", json=body_factory()).json()["solution"]
+    qstar = uncap["total_purchase"]
+    tight = c.post("/api/solve", json=body_factory(purchase_budget=qstar - 1)).json()
+    assert tight["revision"] is None
+    assert tight["solution"]["feasible"] is False
+    assert tight["solution"]["required_min_purchase"] == qstar
+    ok = c.post("/api/solve", json=body_factory(purchase_budget=qstar)).json()
+    assert ok["solution"]["feasible"]
+    assert len(store.list_scenarios()) == 0  # drafts never persist
+
+
+def test_old_archive_without_budget_still_reads_and_solves(tmp_path):
+    """A persisted revision written before purchase_budget existed must load
+    and solve as uncapped."""
+    db = tmp_path / "legacy.json"
+    sid = "legacy000001"
+    legacy_entry = {
+        "id": sid,
+        "revision": 1,
+        "created_at": "2020-01-01T00:00:00+00:00",
+        "updated_at": "2020-01-01T00:00:00+00:00",
+        "name": "legacy",
+        "load": [3] * 8,
+        "pv": [0, 0, 1, 4, 6, 3, 1, 0],
+        "price": [3, 2, 2, 4, 5, 6, 4, 3],
+        "capacity": 20,
+        "initial_soc": 5,
+        "terminal_min_soc": 5,
+        "max_charge": 5,
+        # NOTE: no purchase_budget key
+    }
+    import json
+    db.write_text(json.dumps({sid: {"revisions": [legacy_entry]}}),
+                  encoding="utf-8")
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from app.storage import ScenarioStore
+    app = create_app(ScenarioStore(str(db)))
+    with TestClient(app) as cc:
+        got = cc.get(f"/api/scenarios/{sid}").json()
+        assert got.get("purchase_budget") is None
+        sol = cc.post(f"/api/scenarios/{sid}/solve").json()["solution"]
+        assert sol["feasible"]
+        assert sol["purchase_budget"] is None
+        assert all(pr["remaining_budget"] is None for pr in sol["periods"])
