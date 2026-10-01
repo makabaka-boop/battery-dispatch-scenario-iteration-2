@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>虚拟电池情景求解</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <h1>🔋 虚拟电池情景求解</h1>
+      <span class="tag">纯模拟 · 不连接真实电力设备</span>
+    </header>
+
+    <div class="layout">
+      <!-- 情景列表 -->
+      <aside class="sidebar">
+        <button class="btn primary block" @click="createScenario">＋ 新建情景</button>
+        <h3>情景列表</h3>
+        <ul class="slist">
+          <li v-for="s in list" :key="s.id"
+              :class="{ active: s.id === sid }"
+              @click="select(s.id)">
+            <div class="sname">{{ s.name }}</div>
+            <div class="smeta">{{ s.periods }} 段 · 修订 r{{ s.revision }}</div>
+          </li>
+          <li v-if="!list.length" class="empty">暂无情景</li>
+        </ul>
+        <button v-if="sid" class="btn danger block small" @click="removeScenario">删除当前情景</button>
+      </aside>
+
+      <main class="content">
+        <div v-if="!editing" class="placeholder">
+          请从左侧选择情景，或新建一个情景开始编辑。
+        </div>
+
+        <template v-else>
+          <!-- 状态条 -->
+          <div class="statusbar">
+            <span class="badge" :class="dirty ? 'warn' : 'ok'">
+              {{ dirty ? '● 有未保存修改（基于 r' + savedRevision + '）' : '● 已与服务端 r' + savedRevision + ' 一致' }}
+            </span>
+            <span v-if="plan && !planStale" class="badge ok">当前计划基于 {{ planLabel }}</span>
+            <span v-else-if="plan" class="badge stale">历史结果已失效，不是当前情景的计划</span>
+          </div>
+
+          <div v-if="conflict" class="banner conflict">
+            <strong>保存被拒绝（修订冲突）：</strong>{{ conflict.detail }}
+            <div class="row">
+              <button class="btn small" @click="reloadFromServer">加载服务端 r{{ conflict.current_revision }}（放弃本地修改）</button>
+              <button class="btn small" @click="conflict = null">忽略</button>
+            </div>
+          </div>
+
+          <div v-if="notice" class="banner info">{{ notice }}</div>
+          <div v-if="error" class="banner conflict">{{ error }}</div>
+
+          <!-- 参数编辑 -->
+          <section class="card">
+            <h2>情景参数</h2>
+            <div class="grid">
+              <label>名称<input v-model="editing.name" type="text" /></label></label>
+              <label>电池容量 ≤ 50<input v-model.number="editing.capacity" type="number" min="1" max="50" /></label>
+              <label>初始电量<input v-model.number="editing.initial_soc" type="number" min="0" /></label>
+              <label>终点最低电量<input v-model.number="editing.terminal_min_soc" type="number" min="0" /></label>
+              <label>每段最大充/放<input v-model.number="editing.max_charge" type="number" min="1" /></label>
+            </div>
+
+            <div class="period-head">
+              <h3>时段（{{ editing.load.length }}，允许 8–48）</h3>
+              <div>
+                <button class="btn small" :disabled="n >= 48" @click="addPeriod">＋ 增加时段</button>
+                <button class="btn small" :disabled="n <= 8" @click="dropPeriod">－ 删除末段</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="periods">
+                <thead>
+                  <tr><th>t</th><th>用电</th><th>光伏</th><th>购电单价</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(_, i) in editing.load" :key="i">
+                    <td>{{ i }}</td>
+                    <td><input v-model.number="editing.load[i]" type="number" min="0" /></td>
+                    <td><input v-model.number="editing.pv[i]" type="number" min="0" /></td>
+                    <td><input v-model.number="editing.price[i]" type="number" min="0" /></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="actions">
+              <button class="btn primary" @click="saveScenario" :disabled="saving || !dirty">
+                {{ saving ? '保存中…' : '保存修订（乐观锁）' }}
+              </button>
+              <button class="btn" @click="solveScenario" :disabled="solving">
+                {{ solving ? '求解中…' : '求解当前输入' }}
+              </button>
+              <button class="btn ghost" @click="reloadFromServer" :disabled="!dirty">放弃修改</button>
+            </div>
+            <p class="hint">
+              保存必须携带所基于的修订号；服务端修订号已前进时返回 <code>409</code>，拒绝覆盖。
+              每次编辑或另存为新修订后，旧求解结果立即标记为失效历史，不会被当作新情景的计划。
+            </p>
+          </section>
+
+          <!-- 当前计划 -->
+          <section class="card" v-if="plan && !planStale">
+            <h2>当前计划 · {{ planLabel }}</h2>
+            <solution-view :sol="plan.solution"></solution-view>
+          </section>
+
+          <!-- 历史失效结果 -->
+          <section class="card faded" v-if="plan && planStale">
+            <h2>历史求解结果（已失效）<span class="badge stale">不得作为当前计划</span></h2>
+            <p class="hint">该结果对应 {{ planLabel }}；输入或修订已变化，仅作对照保留。点击「求解当前输入」生成新计划。</p>
+            <solution-view :sol="plan.solution"></solution-view>
+          </section>
+        </template>
+      </main>
+    </div>
+  </div>
+
+  <template id="tpl-solution">
+    <div v-if="!sol.feasible" class="banner conflict">
+      无可行解：{{ sol.reason }}
+    </div>
+    <template v-else>
+      <div class="summary">
+        <div><span class="num">{{ sol.total_cost }}</span><label>总购电费用</label></div>
+        <div><span class="num">{{ sol.total_purchase }}</span><label>总购电量</label></div>
+        <div><span class="num">{{ sol.final_soc }}</span><label>终点电量</label></div>
+      </div>
+      <div class="table-wrap">
+        <table class="result">
+          <thead>
+            <tr>
+              <th>t</th><th>用电</th><th>光伏</th><th>单价</th>
+              <th>期初电量</th><th>充电</th><th>放电</th><th>期末电量</th>
+              <th>购电量</th><th>弃光</th><th>费用</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in sol.periods" :key="r.period">
+              <td>{{ r.period }}</td>
+              <td>{{ r.load }}</td>
+              <td>{{ r.pv }}</td>
+              <td>{{ r.price }}</td>
+              <td>{{ r.soc_start }}</td>
+              <td :class="{ act: r.charge > 0 }">{{ r.charge }}</td>
+              <td :class="{ act: r.discharge > 0 }">{{ r.discharge }}</td>
+              <td>{{ r.soc_end }}</td>
+              <td :class="{ buy: r.purchase > 0 }">{{ r.purchase }}</td>
+              <td :class="{ cur: r.curtail > 0 }">{{ r.curtail }}</td>
+              <td>{{ r.cost }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="hint" v-if="!checks.length">✅ 证据核验通过：逐段电量守恒；无同段又充又放；放电不超过净负载；
+        购电量 = max(0, 净负载 − 放电 + 充电)；弃光 = max(0, −(净负载 − 放电 + 充电))；购电与弃光不并存（不售电）。</p>
+      <ul v-else class="banner conflict"><li v-for="c in checks" :key="c">{{ c }}</li></ul>
+    </template>
+  </template>
+
+  <script src="/static/vendor/vue.global.prod.js"></script>
+  <script>
+  const SolutionView = {
+    props: ['sol'],
+    computed: {
+      checks() {
+        const ps = this.sol.periods;
+        const bad = [];
+        ps.forEach(r => {
+          if (r.soc_end !== r.soc_start + r.charge - r.discharge) bad.push(`t${r.period} 电量不守恒`);
+          if (r.charge > 0 && r.discharge > 0) bad.push(`t${r.period} 同段又充又放`);
+          if (r.discharge > Math.max(0, r.net_load)) bad.push(`t${r.period} 放电超过净负载`);
+          if (r.purchase !== Math.max(0, r.net_load - r.discharge + r.charge)) bad.push(`t${r.period} 购电量不符`);
+          if (r.curtail !== Math.max(0, -(r.net_load - r.discharge + r.charge))) bad.push(`t${r.period} 弃光量不符`);
+          if (r.purchase > 0 && r.curtail > 0) bad.push(`t${r.period} 同时购电与售电嫌疑`);
+          if (r.cost !== r.purchase * r.price) bad.push(`t${r.period} 费用不符`);
+        });
+        return bad;
+      }
+    },
+    template: document.getElementById('tpl-solution').innerHTML
+  };
+
+  const { createApp, reactive, computed, toRefs } = Vue;
+  createApp({
+    components: { SolutionView },
+    setup() {
+      const st = reactive({
+        list: [], sid: null, editing: null, savedSnapshot: null, savedRevision: null,
+        plan: null, conflict: null, notice: null, error: null,
+        saving: false, solving: false,
+      });
+
+      const signature = (s) => JSON.stringify({
+        name: s.name, load: s.load, pv: s.pv, price: s.price,
+        capacity: s.capacity, initial_soc: s.initial_soc,
+        terminal_min_soc: s.terminal_min_soc, max_charge: s.max_charge,
+      });
+
+      const n = computed(() => st.editing ? st.editing.load.length : 0);
+      const dirty = computed(() =>
+        !!st.editing && signature(st.editing) !== signature(st.savedSnapshot));
+      const planStale = computed(() => {
+        if (!st.plan || !st.editing) return true;
+        if (st.plan.sig !== signature(st.editing)) return true;
+        if (st.plan.kind === 'stored' && st.plan.revision !== st.savedRevision) return true;
+        return false;
+      });
+      const planLabel = computed(() => {
+        if (!st.plan) return '';
+        return st.plan.kind === 'stored'
+          ? ('修订 r' + st.plan.revision)
+          : ('未保存草稿（编辑自 r' + st.plan.baseRevision + '）');
+      });
+
+      async function refreshList(selectId) {
+        const r = await fetch('/api/scenarios');
+        st.list = await r.json();
+        if (selectId) st.sid = selectId;
+      }
+
+      function applyEntry(entry) {
+        st.sid = entry.id;
+        st.savedRevision = entry.revision;
+        st.savedSnapshot = { ...entry };
+        st.editing = JSON.parse(JSON.stringify(entry));
+        st.conflict = null;
+        // 加载新情景：清掉一切旧求解响应。
+        st.plan = null;
+      }
+
+      async function select(id) {
+        const r = await fetch(`/api/scenarios/${id}`);
+        applyEntry(await r.json());
+      }
+
+      function defaultScenario() {
+        const n0 = 8;
+        return {
+          name: '新情景 ' + new Date().toLocaleString(),
+          load: Array(n0).fill(3),
+          pv: [0, 0, 1, 4, 6, 3, 1, 0],
+          price: [3, 2, 2, 4, 5, 6, 4, 3],
+          capacity: 20, initial_soc: 5, terminal_min_soc: 5, max_charge: 5,
+        };
+      }
+
+      async function createScenario() {
+        const r = await fetch('/api/scenarios', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(defaultScenario()),
+        });
+        if (!r.ok) { st.error = '创建失败：' + (await r.text()); return; }
+        const entry = await r.json();
+        await refreshList(entry.id);
+        applyEntry(entry);
+      }
+
+      async function removeScenario() {
+        if (!confirm('确认删除该情景及其全部修订？')) return;
+        await fetch(`/api/scenarios/${st.sid}`, { method: 'DELETE' });
+        st.sid = null; st.editing = null; st.plan = null;
+        await refreshList();
+      }
+
+      async function reloadFromServer() {
+        const r = await fetch(`/api/scenarios/${st.sid}`);
+        applyEntry(await r.json());
+        st.notice = '已加载服务端最新修订。';
+      }
+
+      function validateLocal() {
+        const s = st.editing;
+        const errs = [];
+        if (!String(s.name).trim()) errs.push('名称不能为空');
+        if (!(n.value >= 8 && n.value <= 48)) errs.push('时段数需在 8–48');
+        ['load', 'pv', 'price'].forEach(k => {
+          if (s[k].some(v => !Number.isInteger(v) || v < 0)) errs.push(k + ' 必须为非负整数');
+        });
+        if (!(s.capacity >= 1 && s.capacity <= 50)) errs.push('容量需在 1–50');
+        if (s.initial_soc < 0 || s.initial_soc > s.capacity) errs.push('初始电量越界');
+        if (s.terminal_min_soc < 0 || s.terminal_min_soc > s.capacity) errs.push('终点最低电量越界');
+        if (s.max_charge < 1 || s.max_charge > s.capacity) errs.push('每段最大充放电越界');
+        return errs;
+      }
+
+      async function saveScenario() {
+        st.error = null; st.conflict = null;
+        const errs = validateLocal();
+        if (errs.length) { st.error = errs.join('；'); return; }
+        st.saving = true;
+        try {
+          const r = await fetch(`/api/scenarios/${st.sid}`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              expected_revision: st.savedRevision,
+              scenario: (({ id, revision, created_at, updated_at, ...rest }) => rest)(st.editing),
+            }),
+          });
+          if (r.status === 409) {
+            st.conflict = await r.json();
+            return;
+          }
+          if (!r.ok) { st.error = '保存失败：' + (await r.text()); return; }
+          const entry = await r.json();
+          st.notice = `已保存：r${st.savedRevision} → r${entry.revision}。旧求解结果已作废，请重新求解。`;
+          applyEntry(entry);
+          await refreshList(st.sid);
+        } finally { st.saving = false; }
+      }
+
+      async function solveScenario() {
+        st.error = null;
+        const errs = validateLocal();
+        if (errs.length) { st.error = errs.join('；'); return; }
+        st.solving = true;
+        try {
+          const payload = (({ id, revision, created_at, updated_at, ...rest }) => rest)(st.editing);
+          let r, body;
+          if (!dirty.value) {
+            r = await fetch(`/api/scenarios/${st.sid}/solve`, { method: 'POST' });
+            body = await r.json();
+            st.plan = { kind: 'stored', revision: body.revision, sig: signature(st.editing), solution: body.solution };
+          } else {
+            r = await fetch('/api/solve', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+            body = await r.json();
+            st.plan = { kind: 'draft', baseRevision: st.savedRevision, sig: signature(st.editing), solution: body.solution };
+          }
+        } finally { st.solving = false; }
+      }
+
+      function addPeriod() {
+        if (n.value >= 48) return;
+        st.editing.load.push(0); st.editing.pv.push(0); st.editing.price.push(0);
+      }
+      function dropPeriod() {
+        if (n.value <= 8) return;
+        st.editing.load.pop(); st.editing.pv.pop(); st.editing.price.pop();
+      }
+
+      refreshList();
+      return {
+        ...toRefs(st), n, dirty, planStale, planLabel,
+        createScenario, select, removeScenario, reloadFromServer,
+        saveScenario, solveScenario, addPeriod, dropPeriod,
+      };
+    }
+  }).mount('#app');
+  </script>
+</body>
+</html>
