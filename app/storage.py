@@ -33,6 +33,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _normalize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Backfill fields introduced after older archives were written.
+
+    ``purchase_budget`` did not exist in the first schema revision; reading
+    such an archive yields ``None`` (unconstrained) rather than failing.
+    """
+    entry.setdefault("purchase_budget", None)
+    return entry
+
+
 def _entry(payload: Dict[str, Any], scenario_id: str, revision: int,
           created_at: Optional[str] = None) -> Dict[str, Any]:
     ts = _now()
@@ -88,10 +98,10 @@ class ScenarioStore:
             if rec is None:
                 raise ScenarioNotFound(scenario_id)
             if revision is None:
-                return dict(rec["revisions"][-1])
+                return _normalize_entry(dict(rec["revisions"][-1]))
             for rev in rec["revisions"]:
                 if rev["revision"] == revision:
-                    return dict(rev)
+                    return _normalize_entry(dict(rev))
             raise ScenarioNotFound(f"{scenario_id}@r{revision}")
 
     def current_revision(self, scenario_id: str) -> int:

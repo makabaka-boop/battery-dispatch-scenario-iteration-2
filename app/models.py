@@ -21,6 +21,9 @@ class ScenarioInput(BaseModel):
     initial_soc: int = Field(ge=0)
     terminal_min_soc: int = Field(ge=0)
     max_charge: int = Field(ge=1)
+    # Optional cap on the sum of purchase over all periods.  Omitted (None):
+    # unconstrained as before; present: must be a non-negative integer.
+    purchase_budget: Optional[int] = Field(default=None)
 
     @field_validator("name")
     @classmethod
@@ -35,6 +38,13 @@ class ScenarioInput(BaseModel):
     def _nonneg_series(cls, v: List[int]) -> List[int]:
         if any(x < 0 for x in v):
             raise ValueError("series values must be non-negative integers")
+        return v
+
+    @field_validator("purchase_budget")
+    @classmethod
+    def _nonneg_budget(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError("purchase_budget must be a non-negative integer")
         return v
 
     @model_validator(mode="after")
@@ -75,6 +85,7 @@ class PeriodOut(BaseModel):
     purchase: int
     curtail: int
     cost: int
+    remaining_budget: Optional[int] = None
 
 
 class SolutionOut(BaseModel):
@@ -83,6 +94,10 @@ class SolutionOut(BaseModel):
     total_purchase: int
     final_soc: Optional[int] = None
     reason: Optional[str] = None
+    purchase_budget: Optional[int] = None
+    # Minimum total purchase of any physically feasible plan; populated only
+    # when infeasibility is caused solely by the purchase budget.
+    minimum_purchase: Optional[int] = None
     periods: List[PeriodOut]
 
 

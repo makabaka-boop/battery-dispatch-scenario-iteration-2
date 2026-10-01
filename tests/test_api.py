@@ -269,6 +269,149 @@ def test_adhoc_solve_does_not_persist(client):
     assert len(store.list_scenarios()) == before
 
 
+# --------------------------------------------------------------------------
+# purchase budget: validation, constrained solves, revision/signature expiry
+# --------------------------------------------------------------------------
+
+def test_budget_validation(client):
+    c, _ = client
+    assert c.post("/api/scenarios", json=body_factory(purchase_budget=-1)).status_code == 422
+    assert c.post("/api/scenarios", json=body_factory(purchase_budget=-0)).status_code == 201
+    # omitted -> None (unconstrained); 0 is a real zero budget
+    e = create(client)
+    got = c.get(f"/api/scenarios/{e['id']}").json()
+    assert got["purchase_budget"] is None
+
+
+def test_solve_budget_feasible_evidence(client):
+    c, _ = client
+    e = create(client, purchase_budget=1000)
+    r = c.post(f"/api/scenarios/{e['id']}/solve")
+    sol = r.json()["solution"]
+    assert sol["feasible"]
+    assert sol["purchase_budget"] == 1000
+    assert sol["total_purchase"] <= 1000
+    cum = 0
+    for pr in sol["periods"]:
+        cum += pr["purchase"]
+        assert pr["remaining_budget"] == 1000 - cum
+        assert pr["remaining_budget"] >= 0
+    assert sol["minimum_purchase"] is None
+
+
+def test_solve_budget_infeasible_distinguished(client):
+    c, _ = client
+    # load 3 each period, no pv, tiny battery: forced purchase per period.
+    e = create(client, pv=[0] * 8, purchase_budget=1)
+    r = c.post(f"/api/scenarios/{e['id']}/solve")
+    sol = r.json()["solution"]
+    assert sol["feasible"] is False
+    # budget-only failure: minimum purchase diagnostic present, no plan
+    assert sol["minimum_purchase"] is not None
+    assert sol["minimum_purchase"] > 1
+    assert sol["purchase_budget"] == 1
+    assert "budget" in sol["reason"]
+    assert sol["periods"] == []
+    assert sol["final_soc"] is None
+    assert sol["total_cost"] == 0 and sol["total_purchase"] == 0
+    # raising the budget to the reported minimum makes it feasible
+    e2 = c.put(
+        f"/api/scenarios/{e['id']}",
+        json={"expected_revision": 1,
+              "scenario": body_factory(pv=[0] * 8,
+                                       purchase_budget=sol["minimum_purchase"])},
+    ).json()
+    assert e2["revision"] == 2
+    sol2 = c.post(f"/api/scenarios/{e['id']}/solve").json()["solution"]
+    assert sol2["feasible"]
+    assert sol2["total_purchase"] == sol["minimum_purchase"]
+    assert sol2["periods"][-1]["remaining_budget"] == 0
+
+
+def test_solve_physical_infeasible_even_with_budget(client):
+    c, _ = client
+    e = create(client, capacity=10, max_charge=1, initial_soc=0,
+               terminal_min_soc=9, load=[3] * 8, pv=[0] * 8,
+               purchase_budget=10**9)
+    sol = c.post(f"/api/scenarios/{e['id']}/solve").json()["solution"]
+    assert sol["feasible"] is False
+    assert sol["minimum_purchase"] is None
+    assert sol["periods"] == []
+
+
+def test_budget_change_advances_revision_and_invalidates_old(client):
+    """修改额度立即使旧结果失效：same inputs except budget -> new revision;
+    solving the old revision must echo r1 (no budget), the latest r2 carries
+    the budget.  The same applies to the ad-hoc signature path."""
+    c, _ = client
+    e = create(client)
+    sid = e["id"]
+    r1 = c.post(f"/api/scenarios/{sid}/solve").json()
+    assert r1["revision"] == 1
+    assert r1["solution"]["purchase_budget"] is None
+
+    r = c.put(f"/api/scenarios/{sid}",
+              json={"expected_revision": 1,
+                    "scenario": body_factory(purchase_budget=0)})
+    assert r.status_code == 200
+    assert r.json()["revision"] == 2
+    # budget alone is part of the stored revision input
+    assert r.json()["purchase_budget"] == 0
+    # budget-only failure: load=3 each period forces purchase
+    old = c.post(f"/api/scenarios/{sid}/solve", params={"revision": 1}).json()
+    new = c.post(f"/api/scenarios/{sid}/solve").json()
+    assert old["revision"] == 1 and old["solution"]["feasible"]
+    assert new["revision"] == 2 and new["solution"]["feasible"] is False
+    assert new["solution"]["minimum_purchase"] is not None
+
+    # ad-hoc solve of a budgeted draft also reports the constraint
+    draft = c.post("/api/solve", json=body_factory(purchase_budget=0)).json()
+    assert draft["solution"]["purchase_budget"] == 0
+    assert draft["solution"]["feasible"] is False
+
+
+def test_budget_none_and_zero_distinct_signatures(client, tmp_path):
+    """None (omit) and 0 must be distinguishable stored inputs across the
+    model, storage and solve layers — they are never the same signature."""
+    c, _ = client
+    e_none = create(client, name="none-budget")
+    e_zero = create(client, name="zero-budget", purchase_budget=0)
+    got_none = c.get(f"/api/scenarios/{e_none['id']}").json()
+    got_zero = c.get(f"/api/scenarios/{e_zero['id']}").json()
+    assert got_none["purchase_budget"] is None
+    assert got_zero["purchase_budget"] == 0
+
+
+def test_old_archive_without_budget_reads(client, tmp_path):
+    """An archive written before purchase_budget existed still loads and
+    solves (treated as unconstrained)."""
+    c, _ = client
+    e = create(client)
+    # simulate an old on-disk revision: strip the field from the file
+    import json
+    # reuse the store's own file path
+    path = c.app.state.store._path
+    assert path
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for sid, rec in data.items():
+        for rev in rec["revisions"]:
+            rev.pop("purchase_budget", None)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    # fresh store over the same legacy file
+    from app.storage import ScenarioStore
+    app2 = create_app(ScenarioStore(path))
+    with TestClient(app2) as c2:
+        got = c2.get(f"/api/scenarios/{e['id']}").json()
+        assert got["purchase_budget"] is None
+        sol = c2.post(f"/api/scenarios/{e['id']}/solve").json()["solution"]
+        assert sol["feasible"]
+        assert sol["purchase_budget"] is None
+        assert all(p["remaining_budget"] is None for p in sol["periods"])
+
+
 def test_list_and_delete(client):
     c, _ = client
     e = create(client)
